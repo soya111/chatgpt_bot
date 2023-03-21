@@ -10,11 +10,15 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-lambda-go/lambdacontext"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/awslabs/aws-lambda-go-api-proxy/core"
+	"github.com/guregu/dynamo"
 	"github.com/line/line-bot-sdk-go/linebot"
 )
 
@@ -23,6 +27,7 @@ const openaiURL = "https://api.openai.com/v1/chat/completions"
 var baseMessages []Message
 var bot *linebot.Client
 var apiKey string
+var sess *session.Session
 
 func init() {
 	var err error
@@ -40,6 +45,8 @@ func init() {
 	})
 
 	apiKey = os.Getenv("OPENAI_API_KEY")
+
+	sess = session.Must(session.NewSession())
 }
 func main() {
 	lambda.Start(handler)
@@ -75,18 +82,24 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 		for _, event := range events {
 			switch event.Type {
 			case linebot.EventTypeMessage:
-				switch message := event.Message.(type) {
+				switch event.Message.(type) {
 				case *linebot.TextMessage:
-					messages := append(baseMessages, Message{
-						Role:    "user",
-						Content: message.Text,
-					})
+
+					// baseMessagesにdynamoDBから取得したメッセージを追加
+					messages := append(baseMessages, getMessagesFromDynamoDB(event)...)
+					// messages = append(messages, Message{
+					// 	Role:    "user",
+					// 	Content: message.Text,
+					// })
 
 					response := getOpenAIResponse(apiKey, messages)
 					if _, err = bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(response.Choices[0].Messages.Content)).Do(); err != nil {
 						fmt.Printf("RequestId: %s, Method: %s, Path: %s, Body: %s\n", requestId, method, path, body)
 						return newResponse(http.StatusInternalServerError), err
 					}
+
+					// dynamoDBにアシスタントのメッセージを保存
+					putMessageToDynamoDB(event, response.Choices[0].Messages.Role, response.Choices[0].Messages.Content)
 				}
 			}
 		}
@@ -184,4 +197,73 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+}
+
+type ChatHistory struct {
+	ChatIdentifier string `dynamo:"chatId"`      // 会話の識別子
+	Timestamp      int64  `dynamo:"timestamp,N"` // メッセージのタイムスタンプ
+	Message        string `dynamo:"message"`     // メッセージの内容
+	Role           string `dynamo:"role"`        // メッセージの役割（ユーザーまたはアシスタント）
+}
+
+// DynamoDBから過去の会話を取得するメソッド
+func getMessagesFromDynamoDB(event *linebot.Event) []Message {
+	db := dynamo.New(sess, &aws.Config{Region: aws.String("ap-northeast-1")})
+	table := db.Table("line_log")
+	chatId := getChatIdentifier(event)
+
+	// DynamoDBに会話を保存する
+	putMessageToDynamoDB(event, "user", event.Message.(*linebot.TextMessage).Text)
+
+	// 会話の識別子をキーにして、会話の履歴を取得する
+	var chatHistories []ChatHistory
+	err := table.Get("chatId", chatId).All(&chatHistories)
+	if err != nil {
+		fmt.Println(err)
+		return []Message{}
+	}
+
+	// 会話の履歴をMessage型に変換する
+	var messages []Message
+	for _, chatHistory := range chatHistories {
+		messages = append(messages, Message{
+			Role:    chatHistory.Role,
+			Content: chatHistory.Message,
+		})
+	}
+
+	return messages
+}
+
+// DynamoDBに会話の履歴を書き込むメソッド
+func putMessageToDynamoDB(event *linebot.Event, role string, message string) {
+	db := dynamo.New(sess, &aws.Config{Region: aws.String("ap-northeast-1")})
+	table := db.Table("line_log")
+	chatId := getChatIdentifier(event)
+
+	// 会話の履歴をChatHistory型に変換する
+	chatHistory := ChatHistory{
+		ChatIdentifier: chatId,
+		Timestamp:      time.Now().Unix(),
+		Message:        message,
+		Role:           role,
+	}
+
+	// 会話の履歴をDynamoDBに書き込む
+	err := table.Put(chatHistory).Run()
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+
+// *linebot.Eventから会話の識別子を取得するメソッド
+func getChatIdentifier(event *linebot.Event) string {
+	// グループまたはトークルームの場合は、グループIDまたはトークルームIDを返す
+	if event.Source.Type == linebot.EventSourceTypeGroup {
+		return event.Source.GroupID
+	} else if event.Source.Type == linebot.EventSourceTypeRoom {
+		return event.Source.RoomID
+	} else {
+		return event.Source.UserID
+	}
 }
