@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -28,6 +29,7 @@ var baseMessages []Message
 var bot *linebot.Client
 var apiKey string
 var sess *session.Session
+var recentChatsLimit int
 
 func init() {
 	var err error
@@ -47,7 +49,15 @@ func init() {
 	apiKey = os.Getenv("OPENAI_API_KEY")
 
 	sess = session.Must(session.NewSession())
+
+	recentChatsLimitStr := os.Getenv("RECENT_CHATS_LIMIT")
+	recentChatsLimit, err = strconv.Atoi(recentChatsLimitStr)
+	if err != nil {
+		fmt.Println("Error parsing RECENT_CHATS_LIMIT:", err)
+		return
+	}
 }
+
 func main() {
 	lambda.Start(handler)
 }
@@ -60,6 +70,8 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 	lambdaCtx, _ := lambdacontext.FromContext(ctx)
 	requestId := lambdaCtx.AwsRequestID
 
+	fmt.Printf("RequestId: %s, Method: %s, Path: %s, Body: %s\n", requestId, method, path, body)
+
 	switch path {
 	case "/ChatGPT":
 		// LINEのsdkがHTTPを前提にParseしているのでHttpRequestに戻す
@@ -71,7 +83,6 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 
 		events, err := bot.ParseRequest(httpRequest)
 		if err != nil {
-			fmt.Printf("RequestId: %s, Method: %s, Path: %s, Body: %s\n", requestId, method, path, body)
 			if err == linebot.ErrInvalidSignature {
 				return newResponse(http.StatusBadRequest), err
 			} else {
@@ -94,7 +105,6 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 
 					response := getOpenAIResponse(apiKey, messages)
 					if _, err = bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(response.Choices[0].Messages.Content)).Do(); err != nil {
-						fmt.Printf("RequestId: %s, Method: %s, Path: %s, Body: %s\n", requestId, method, path, body)
 						return newResponse(http.StatusInternalServerError), err
 					}
 
@@ -217,7 +227,7 @@ func getMessagesFromDynamoDB(event *linebot.Event) []Message {
 
 	// 会話の識別子をキーにして、会話の履歴を取得する
 	var chatHistories []ChatHistory
-	err := table.Get("chatId", chatId).All(&chatHistories)
+	err := table.Get("chatId", chatId).Limit(int64(recentChatsLimit)).Order(false).All(&chatHistories)
 	if err != nil {
 		fmt.Println(err)
 		return []Message{}
@@ -225,7 +235,7 @@ func getMessagesFromDynamoDB(event *linebot.Event) []Message {
 
 	// 会話の履歴をMessage型に変換する
 	var messages []Message
-	for _, chatHistory := range chatHistories {
+	for _, chatHistory := range reverseChatHistories(chatHistories) {
 		messages = append(messages, Message{
 			Role:    chatHistory.Role,
 			Content: chatHistory.Message,
@@ -266,4 +276,13 @@ func getChatIdentifier(event *linebot.Event) string {
 	} else {
 		return event.Source.UserID
 	}
+}
+
+// ChatHistory型のスライスをリバースするメソッド
+func reverseChatHistories(chatHistories []ChatHistory) []ChatHistory {
+	for i := len(chatHistories)/2 - 1; i >= 0; i-- {
+		opp := len(chatHistories) - 1 - i
+		chatHistories[i], chatHistories[opp] = chatHistories[opp], chatHistories[i]
+	}
+	return chatHistories
 }
