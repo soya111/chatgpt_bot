@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -98,12 +97,13 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 
 					// baseMessagesにdynamoDBから取得したメッセージを追加
 					messages := append(baseMessages, getMessagesFromDynamoDB(event)...)
-					// messages = append(messages, Message{
-					// 	Role:    "user",
-					// 	Content: message.Text,
-					// })
 
-					response := getOpenAIResponse(apiKey, messages)
+					response, err := getOpenAIResponse(apiKey, messages)
+					if err != nil {
+						return newResponse(http.StatusInternalServerError), err
+					}
+					// responseの中身をログに出力
+					fmt.Println(response)
 					if _, err = bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(response.Choices[0].Messages.Content)).Do(); err != nil {
 						return newResponse(http.StatusInternalServerError), err
 					}
@@ -119,19 +119,13 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 	}
 }
 
-func newAPIGatewayProxyResponse() events.APIGatewayProxyResponse {
+func newResponse(statusCode int) events.APIGatewayProxyResponse {
 	var headers = make(map[string]string)
 	var mHeaders = make(map[string][]string)
-	return events.APIGatewayProxyResponse{Headers: headers, MultiValueHeaders: mHeaders}
+	return events.APIGatewayProxyResponse{StatusCode: statusCode, Headers: headers, MultiValueHeaders: mHeaders}
 }
 
-func newResponse(statusCode int) events.APIGatewayProxyResponse {
-	res := newAPIGatewayProxyResponse()
-	res.StatusCode = statusCode
-	return res
-}
-
-func getOpenAIResponse(apiKey string, messages []Message) OpenaiResponse {
+func getOpenAIResponse(apiKey string, messages []Message) (OpenaiResponse, error) {
 	requestBody := OpenaiRequest{
 		Model:    "gpt-3.5-turbo",
 		Messages: messages,
@@ -159,7 +153,7 @@ func getOpenAIResponse(apiKey string, messages []Message) OpenaiResponse {
 		}
 	}(resp.Body)
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		panic(err)
 	}
@@ -168,15 +162,10 @@ func getOpenAIResponse(apiKey string, messages []Message) OpenaiResponse {
 	err = json.Unmarshal(body, &response)
 	if err != nil {
 		println("Error: ", err.Error())
-		return OpenaiResponse{}
+		return OpenaiResponse{}, err
 	}
 
-	// messages = append(messages, Message{
-	// 	Role:    "assistant",
-	// 	Content: response.Choices[0].Messages.Content,
-	// })
-
-	return response
+	return response, nil
 }
 
 type OpenaiRequest struct {
