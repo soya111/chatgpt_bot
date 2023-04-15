@@ -1,15 +1,14 @@
 package main
 
 import (
-	"bytes"
+	"chatgpt/pkg/openai"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -22,9 +21,7 @@ import (
 	"github.com/line/line-bot-sdk-go/linebot"
 )
 
-const openaiURL = "https://api.openai.com/v1/chat/completions"
-
-var baseMessages []Message
+var baseMessages []openai.Message
 var bot *linebot.Client
 var apiKey string
 var sess *session.Session
@@ -40,7 +37,7 @@ func init() {
 		log.Fatal(err)
 	}
 
-	baseMessages = append(baseMessages, Message{
+	baseMessages = append(baseMessages, openai.Message{
 		Role:    "system",
 		Content: os.Getenv("ROLE_PROMPT"),
 	})
@@ -95,15 +92,22 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 				switch event.Message.(type) {
 				case *linebot.TextMessage:
 
+					// DynamoDBに会話を保存する
+					putMessageToDynamoDB(event, "user", event.Message.(*linebot.TextMessage).Text)
+
 					// baseMessagesにdynamoDBから取得したメッセージを追加
 					messages := append(baseMessages, getMessagesFromDynamoDB(event)...)
 
-					response, err := getOpenAIResponse(apiKey, messages)
+					request, err := openai.NewOpenAIRequest(apiKey, messages)
+					if err != nil {
+						return newResponse(http.StatusInternalServerError), err
+					}
+					response, err := openai.GetOpenAIResponse(request)
 					if err != nil {
 						return newResponse(http.StatusInternalServerError), err
 					}
 					// responseの中身をログに出力
-					fmt.Println(response)
+					fmt.Println(strings.ReplaceAll(fmt.Sprintf("%+v", response), "\n", " "))
 					if _, err = bot.ReplyMessage(event.ReplyToken, linebot.NewTextMessage(response.Choices[0].Messages.Content)).Do(); err != nil {
 						return newResponse(http.StatusInternalServerError), err
 					}
@@ -125,79 +129,6 @@ func newResponse(statusCode int) events.APIGatewayProxyResponse {
 	return events.APIGatewayProxyResponse{StatusCode: statusCode, Headers: headers, MultiValueHeaders: mHeaders}
 }
 
-func getOpenAIResponse(apiKey string, messages []Message) (OpenaiResponse, error) {
-	requestBody := OpenaiRequest{
-		Model:    "gpt-3.5-turbo",
-		Messages: messages,
-	}
-
-	requestJSON, _ := json.Marshal(requestBody)
-
-	req, err := http.NewRequest("POST", openaiURL, bytes.NewBuffer(requestJSON))
-	if err != nil {
-		panic(err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		panic(err)
-	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			panic(err)
-		}
-	}(resp.Body)
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		panic(err)
-	}
-
-	var response OpenaiResponse
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		println("Error: ", err.Error())
-		return OpenaiResponse{}, err
-	}
-
-	return response, nil
-}
-
-type OpenaiRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-}
-
-type OpenaiResponse struct {
-	ID      string   `json:"id"`
-	Object  string   `json:"object"`
-	Created int      `json:"created"`
-	Choices []Choice `json:"choices"`
-	Usages  Usage    `json:"usage"`
-}
-
-type Choice struct {
-	Index        int     `json:"index"`
-	Messages     Message `json:"message"`
-	FinishReason string  `json:"finish_reason"`
-}
-
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
 type ChatHistory struct {
 	ChatIdentifier string `dynamo:"chatId"`      // 会話の識別子
 	Timestamp      int64  `dynamo:"timestamp,N"` // メッセージのタイムスタンプ
@@ -206,26 +137,23 @@ type ChatHistory struct {
 }
 
 // DynamoDBから過去の会話を取得するメソッド
-func getMessagesFromDynamoDB(event *linebot.Event) []Message {
+func getMessagesFromDynamoDB(event *linebot.Event) []openai.Message {
 	db := dynamo.New(sess, &aws.Config{Region: aws.String("ap-northeast-1")})
 	table := db.Table("line_log")
 	chatId := getChatIdentifier(event)
-
-	// DynamoDBに会話を保存する
-	putMessageToDynamoDB(event, "user", event.Message.(*linebot.TextMessage).Text)
 
 	// 会話の識別子をキーにして、会話の履歴を取得する
 	var chatHistories []ChatHistory
 	err := table.Get("chatId", chatId).Limit(int64(recentChatsLimit)).Order(false).All(&chatHistories)
 	if err != nil {
 		fmt.Println(err)
-		return []Message{}
+		return []openai.Message{}
 	}
 
 	// 会話の履歴をMessage型に変換する
-	var messages []Message
+	var messages []openai.Message
 	for _, chatHistory := range reverseChatHistories(chatHistories) {
-		messages = append(messages, Message{
+		messages = append(messages, openai.Message{
 			Role:    chatHistory.Role,
 			Content: chatHistory.Message,
 		})
